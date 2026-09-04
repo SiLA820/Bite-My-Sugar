@@ -1,0 +1,273 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <time.h>
+#include <esp_sleep.h>
+
+// ==========================================
+// 1. GLOBAL VARIABLES & DECLARATIONS
+// ==========================================
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+String wifi_ssid="", wifi_password="", wifi_ssid2="", wifi_password2="", wifi_ssid3="", wifi_password3="";
+String llu_email="", llu_password="", glucose_value="--";
+String jwt_token="", account_id_hash="", last_reading_time="Never";
+WebServer server(80); DNSServer dnsServer; Preferences prefs;
+
+unsigned long last_fetch = 0;
+int cfg_fetch_min = 5; 
+int cfg_tz_offset = 0; 
+int cfg_dst_active = 1;
+int min_g = 999; 
+int max_g = 0;
+bool ap_mode_active = false;
+int cfg_server_region = 0; // 0 = EU, 1 = US
+
+// Forward Declarations
+void init_display_hard(); 
+void handle_clear(); 
+void handle_root();
+void handle_save();
+void try_multi_wifi();
+void update_display();
+void fetch_glucose();
+String get_api_url();
+String get_time(bool include_seconds);
+
+// ==========================================
+// 2. TIMING & REGIONAL SERVER ENGINE
+// ==========================================
+String get_api_url() { 
+    if (cfg_server_region == 1) {
+        return "https://api.libreview.io"; // US Server
+    }
+    return "https://api-eu.libreview.io"; // EU Server (Default)
+}
+
+String get_time(bool include_seconds) { 
+    struct tm ti; 
+    if(!getLocalTime(&ti)) return include_seconds ? "--:--:--" : "--:--"; 
+    char b[16]; 
+    strftime(b, sizeof(b), include_seconds ? "%H:%M:%S" : "%H:%M", &ti); 
+    return String(b); 
+}
+
+void try_multi_wifi() {
+    String ssids[] = {wifi_ssid, wifi_ssid2, wifi_ssid3}; 
+    String passes[] = {wifi_password, wifi_password2, wifi_password3};
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+        String available_ssid = WiFi.SSID(i);
+        for (int j = 0; j < 3; j++) { 
+            if (ssids[j] != "" && available_ssid == ssids[j]) { 
+                WiFi.begin(ssids[j].c_str(), passes[j].c_str()); 
+                int c = 0; 
+                while (WiFi.status() != WL_CONNECTED && c++ < 20) delay(250); 
+                if (WiFi.status() == WL_CONNECTED) return; 
+            } 
+        }
+    }
+}
+
+// ==========================================
+// 3. HARDWARE DISPLAY ENGINE
+// ==========================================
+void init_display_hard() { 
+    Wire.begin(3, 4); Wire.setClock(100000); delay(150); 
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C); 
+    Wire.beginTransmission(0x3C); Wire.write(0x00); Wire.write(0xDA); Wire.write(0x12); Wire.endTransmission();
+    display.clearDisplay(); display.display(); 
+}
+
+void update_display() {
+    Wire.beginTransmission(0x3C); Wire.write(0x00); Wire.write(0xDA); Wire.write(0x12); Wire.endTransmission();
+    display.clearDisplay(); display.invertDisplay(false); 
+    String lt_min = get_time(false); int16_t x1, y1; uint16_t w, h_text;
+    for(int i = 0; i < 16; i++) { display.drawFastHLine(0, i, 128, SSD1306_WHITE); }
+    display.setTextColor(SSD1306_BLACK); display.setTextSize(2); 
+    display.getTextBounds(lt_min, 0, 2, &x1, &y1, &w, &h_text); display.setCursor(64 - (w/2), 1); display.print(lt_min); 
+    display.setTextColor(SSD1306_WHITE); 
+    if (glucose_value == "AUTH_ERR" || glucose_value == "NO_MEAS" || glucose_value == "NO_DATA" || glucose_value == "HTML_BLK" || glucose_value == "JSON_ERR") {
+        display.setTextSize(2); display.getTextBounds(glucose_value, 0, 32, &x1, &y1, &w, &h_text); display.setCursor(64 - (w/2), 32); display.print(glucose_value);
+    } else {
+        display.setTextSize(5); display.getTextBounds(glucose_value, 0, 22, &x1, &y1, &w, &h_text);
+        int num_x = 12; display.setCursor(num_x, 22); display.print(glucose_value);
+        display.setTextSize(2); display.setCursor(94, 24); display.print("mg"); display.setCursor(94, 42); display.print("dL");
+    }
+    display.display();
+}
+// ==========================================
+// 4. ABBOTT LIBRELINKUP API CALLS
+// ==========================================
+String sha256(String payload) {
+    uint8_t shaResult[32]; // Deve essere un array di 32 byte!
+    mbedtls_md_context_t ctx; mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+    mbedtls_md_init(&ctx); mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 0); mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, (const unsigned char*) payload.c_str(), payload.length()); 
+    mbedtls_md_finish(&ctx, shaResult); mbedtls_md_free(&ctx);
+    String hashStr = ""; 
+    for(int i=0; i<32; i++) { if(shaResult[i]<16) hashStr += "0"; hashStr += String(shaResult[i], HEX); } 
+    return hashStr;
+}
+
+bool login_llu() {
+    if (llu_email == "" || llu_password == "") return false;
+    WiFiClientSecure client; client.setInsecure(); HTTPClient http; http.setTimeout(10000);
+    http.begin(client, get_api_url() + "/llu/auth/login"); http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.addHeader("Content-Type", "application/json"); http.addHeader("version", "4.16.0"); http.addHeader("product", "llu.android"); http.addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13; LLU App)"); http.addHeader("Accept", "application/json, text/plain, */*");
+    JsonDocument doc; doc["email"] = llu_email; doc["password"] = llu_password;
+    String requestBody; serializeJson(doc, requestBody); int httpResponseCode = http.POST(requestBody);
+    if (httpResponseCode == 200) { 
+        String response = http.getString(); JsonDocument resDoc; deserializeJson(resDoc, response); 
+        jwt_token = resDoc["data"]["authTicket"]["token"].as<String>(); 
+        account_id_hash = sha256(resDoc["data"]["user"]["id"].as<String>()); 
+        http.end(); return true; 
+    }
+    jwt_token = ""; http.end(); return false;
+}
+
+void fetch_glucose() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (jwt_token == "" && !login_llu()) { glucose_value = "AUTH_ERR"; update_display(); return; }
+    WiFiClientSecure client; client.setInsecure(); HTTPClient http; http.setTimeout(10000);
+    http.begin(client, get_api_url() + "/llu/connections"); http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.addHeader("Authorization", "Bearer " + jwt_token); http.addHeader("account-id", account_id_hash); http.addHeader("version", "4.16.0"); http.addHeader("product", "llu.android"); http.addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13; LLU App)"); http.addHeader("Accept", "application/json, text/plain, */*");
+    int httpResponseCode = http.GET();
+    if (httpResponseCode == 401 || httpResponseCode == 403 || httpResponseCode < 0) { jwt_token = ""; http.end(); return; }
+    if (httpResponseCode == 200) {
+        String response = http.getString(); 
+        if (response.indexOf("<html") != -1 || response.indexOf("<!DOCTYPE html>") != -1) { glucose_value = "HTML_BLK"; update_display(); http.end(); return; }
+        JsonDocument resDoc; DeserializationError error = deserializeJson(resDoc, response); 
+        if (error) { glucose_value = "JSON_ERR"; update_display(); http.end(); return; }
+        JsonObject connection; bool dataFound = false; 
+        if (resDoc["data"].is<JsonArray>() && resDoc["data"].size() > 0) { connection = resDoc["data"].as<JsonObject>(); dataFound = true; } 
+        else if (resDoc["data"].is<JsonObject>()) { connection = resDoc["data"].as<JsonObject>(); dataFound = true; }
+        if (dataFound) { 
+            if (connection.containsKey("glucoseMeasurement")) { 
+                glucose_value = connection["glucoseMeasurement"]["Value"].as<String>(); 
+                int bg = glucose_value.toInt();
+                if (bg > 0) { if (bg < min_g) min_g = bg; if (bg > max_g) max_g = bg; }
+                update_display(); 
+            } else { glucose_value = "NO_MEAS"; update_display(); } 
+        } else { glucose_value = "NO_DATA"; update_display(); }
+    } else { update_display(); }
+    http.end();
+}
+
+// ==========================================
+// 5. BENDER WEB SERVER PORTAL
+// ==========================================
+void handle_root() {
+    int bg = glucose_value.toInt(); String statusColor = "#f59e0b"; String benderComment = "Listening... or maybe taking a nap. Who cares?";
+    if (bg > 0) {
+        if (bg < 70) { statusColor = "#ef4444"; benderComment = "Low sugar! Move your organic butt and ingest something sweet right now!"; } 
+        else if (bg > 180) { statusColor = "#ef4444"; benderComment = "Way too sweet, meatbag! Careful or you're gonna corrode your squishy circuits!"; } 
+        else { statusColor = "#10b981"; benderComment = "Glucose normal. Great, now get lost so I can go drink a beer in peace."; }
+    } else { benderComment = "No data from Abbott. Either their servers are down or you typed it wrong, dummy!"; }
+    
+    String h = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'><title>Bender Control Unit 22</title><style>";
+    h += "*{box-sizing:border-box;margin:0;padding:0;}html,body{overflow-x:hidden; background:#1e222b;}body{font-family:'Courier New',monospace;color:#d1d5db;padding:8px 20px 40px 20px;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;}.wrapper{display:flex;flex-direction:column;align-items:center;width:100%;max-width:440px;padding-top:40px;}";
+    h += ".antenna{width:20px;height:45px;background:#5a697c;border-radius:6px 6px 0 0;border:3px solid #2d3440;box-shadow:inset -3px 0 rgba(0,0,0,0.2);margin-bottom:-6px;z-index:2;position:relative;}.antenna::after{content:'';position:absolute;top:-22px;left:-6px;width:26px;height:22px;background:#ffe600;border-radius:50%;border:3px solid #2d3440;box-shadow:inset -4px -2px rgba(0,0,0,0.3);}";
+    h += ".card{background:#3a4454;padding:30px 24px;border-radius:12px;border:6px solid #5a697c;width:100%;box-shadow:0 25px 50px rgba(0,0,0,0.6);position:relative;z-index:1;}.card::before{content:'';position:absolute;top:4px;left:4px;right:4px;bottom:4px;border:2px dashed #2d3440;border-radius:6px;pointer-events:none;}";
+    h += "h2{color:#ffe600;font-size:24px;text-align:center;font-weight:900;text-transform:uppercase;text-shadow:2px 2px #000;margin-bottom:2px;}.subtitle{text-align:center;font-size:11px;color:#cbd5e1;font-weight:bold;margin-bottom:25px;}.val-box{background:#111827;border-radius:8px;padding:20px;text-align:center;border:4px solid #2d3440;margin-bottom:25px;box-shadow:inset 0 4px 10px rgba(0,0,0,0.8);}";
+    h += ".val{font-size:55px;font-weight:900;color:" + statusColor + ";text-shadow:0 0 10px rgba(255,230,0,0.2);line-height:1;}.unit{font-size:12px;color:#9ca3af;margin-top:6px;display:block;font-weight:bold;}.bender-speech{background:#fff;color:#000;padding:12px;border-radius:8px;position:relative;margin-bottom:25px;font-size:13px;font-weight:bold;border:3px solid #111827;}";
+    h += ".bender-speech::after{content:'';position:absolute;bottom:-12px;left:30px;border-width:12px 12px 0;border-style:solid;border-color:#fff transparent;display:block;width:0;}.bender-speech::before{content:'';position:absolute;bottom:-17px;left:29px;border-width:13px 13px 0;border-style:solid;border-color:#111827 transparent;display:block;width:0;}h3{font-size:13px;color:#ffe600;text-transform:uppercase;margin:20px 0 10px 0;font-weight:900;text-shadow:1px 1px #000;display:flex;align-items:center;}";
+    h += "label{display:block;font-size:11px;color:#e5e7eb;margin:8px 0 3px 2px;font-weight:bold;}input[type=text],input[type=password],select{width:100%;padding:11px;border-radius:6px;border:3px solid #2d3440;background:#232936;color:#ffe600;font-size:14px;font-weight:bold;font-family:monospace;}input[type=text]:focus,input[type=password]:focus,select:focus{border-color:#ffe600;outline:none;}.btn{width:100%;background:#ffe600;color:#000000;font-weight:900;font-size:15px;padding:14px;margin-top:25px;border-radius:6px;cursor:pointer;border:3px solid #000;text-transform:uppercase;transition:all 0.1s;}.btn:hover{background:#e6b800;transform:scale(1.02);box-shadow:0 6px 15px rgba(0,0,0,0.4);}.btn-del{width:100%;background:#ef4444;color:#ffffff;font-size:11px;font-weight:bold;padding:10px;margin-top:20px;border-radius:6px;cursor:pointer;border:2px solid #000;text-transform:uppercase;}</style></head><body>";
+    
+    h += "<div class='wrapper'><div class='antenna'></div><div class='card'><h2>BENDER B. RODRÍGUEZ</h2><div class='subtitle'>Biological Monitoring Unit v1.0</div><div class='bender-speech'>\"" + benderComment + "\"</div><div class='val-box'><div class='val'>" + glucose_value + "</div><span class='unit'>mg/dL &bull; HUMAN GLUCOSE</span></div><form action='/save' method='POST'>";
+    h += "<h3>[ Antenna Wi-Fi Links ]</h3><label>Primary SSID (Required)</label><input type='text' name='ssid' value='" + wifi_ssid + "' placeholder='Home network, human'><label>Access Key</label><input type='password' name='w_pass' value='" + wifi_password + "'>";
+    h += "<label>Secondary SSID (Backup Node)</label><input type='text' name='ssid2' value='" + wifi_ssid2 + "'>";
+    h += "<label>Access Key 2</label><input type='password' name='w_pass2' value='" + wifi_password2 + "'>";
+    h += "<label>Tertiary SSID (Steal from neighbors)</label><input type='text' name='ssid3' value='" + wifi_ssid3 + "'><label>Access Key 3</label><input type='password' name='w_pass3' value='" + wifi_password3 + "'>";
+    
+    h += "<h3>[ Abbott Cloud Region ]</h3><label>Account Server Country</label><select name='cfg_region'><option value='0'" + String(cfg_server_region == 0 ? " selected" : "") + ">Europe (api-eu.libreview.io)</option><option value='1'" + String(cfg_server_region == 1 ? " selected" : "") + ">United States (api.libreview.io)</option></select>";
+    h += "<h3>[ Meatbag Credentials ]</h3>";
+    h += "<label>Abbott Account Email</label><input type='text' name='email' value='" + llu_email + "' placeholder='meatbag@universe.com'>";
+    h += "<label>Abbott Account Password</label><input type='password' name='pass' value='" + llu_password + "'>";
+    
+    h += "<input type='submit' class='btn' value='Save & Reboot this junk!'></form>";
+    h += "<form action='/clear' method='POST'><input type='submit' class='btn btn-del' value='Cross Circuits (Wipe Device)' onclick='return confirm(\"Wipe memory? I\\'m gonna go gamble on robot greyhounds if you do!\")'></form>";
+    h += "</div></div></body></html>";
+    server.send(200, "text/html", h);
+}
+
+void handle_save() {
+    if (server.hasArg("ssid") && server.hasArg("email")) {
+        wifi_ssid = server.arg("ssid"); wifi_password = server.arg("w_pass"); 
+        wifi_ssid2 = server.arg("ssid2"); wifi_password2 = server.arg("w_pass2"); 
+        wifi_ssid3 = server.arg("ssid3"); wifi_password3 = server.arg("w_pass3"); 
+        llu_email = server.arg("email"); llu_password = server.arg("pass");
+        cfg_server_region = server.arg("cfg_region").toInt();
+        
+        prefs.begin("cgm-config", false); 
+        prefs.putString("w_ssid", wifi_ssid); prefs.putString("w_pass", wifi_password); 
+        prefs.putString("w_ssid2", wifi_ssid2); prefs.putString("w_pass2", wifi_password2); 
+        prefs.putString("w_ssid3", wifi_ssid3); prefs.putString("w_pass3", wifi_password3); 
+        prefs.putString("email", llu_email); prefs.putString("pass", llu_password); 
+        prefs.putInt("cfg_region", cfg_server_region);
+        prefs.putInt("cfg_fetch", cfg_fetch_min); // Aggiunta questa riga per salvare il tempo di sleep!
+        prefs.end();
+        
+        try_multi_wifi(); 
+        String next_ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "192.168.4.1";
+        String r = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='5;url=http://" + next_ip + "'><style>body{font-family:'Courier New',monospace;background:#1e222b;color:#ffe600;text-align:center;padding-top:30vh;} .ok{font-size:28px;font-weight:900;text-transform:uppercase;text-shadow:2px 2px #000;margin-bottom:15px;} p{color:#d1d5db; font-size:14px;}</style></head><body><div class='ok'>✔ SETTINGS SAVED, HUMAN!</div><p>Rebooting module. Bite my shiny metal ass and wait for redirection...</p></body></html>";
+        server.send(200, "text/html", r); delay(1500); ESP.restart();
+    }
+}
+
+void handle_clear() { prefs.begin("cgm-config", false); prefs.clear(); prefs.end(); server.send(200, "text/html", "Wiped"); delay(2000); ESP.restart(); }
+
+// ==========================================
+// 6. CORE FIRMWARE ENGINE (SETUP & LOOP)
+// ==========================================
+void setup() {
+    Serial.begin(115200); delay(500); Serial.println("--- LIGHT SLEEP ENGINE START ---");
+    pinMode(LED_BUILTIN, OUTPUT); digitalWrite(LED_BUILTIN, HIGH); 
+    setCpuFrequencyMhz(240); init_display_hard();
+    
+    prefs.begin("cgm-config", false); 
+    wifi_ssid = prefs.getString("w_ssid", ""); wifi_password = prefs.getString("w_pass", ""); 
+    wifi_ssid2 = prefs.getString("w_ssid2", ""); wifi_password2 = prefs.getString("w_pass2", ""); 
+    wifi_ssid3 = prefs.getString("w_ssid3", ""); wifi_password3 = prefs.getString("w_pass3", ""); 
+    llu_email = prefs.getString("email", ""); llu_password = prefs.getString("pass", ""); 
+    cfg_fetch_min = prefs.getInt("cfg_fetch", 5); 
+    cfg_server_region = prefs.getInt("cfg_region", 0); 
+    prefs.end();
+    
+    if (wifi_ssid == "") {
+        WiFi.softAP("Bite My", "SiLA820", 1, 0, 4, WIFI_AUTH_WPA2_PSK); dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+        server.on("/", handle_root); server.on("/save", handle_save); server.on("/clear", handle_clear); server.onNotFound(handle_root);
+        server.begin(); ap_mode_active = true;
+        display.setTextSize(1); display.setCursor(10, 20); display.print("Connect to BENDER_AP"); display.display();
+    } else {
+        try_multi_wifi();
+        if (WiFi.status() == WL_CONNECTED) { 
+            configTime(0, 3600, "pool.ntp.org", "google.com"); 
+            delay(1000); struct tm ti; int r=0; while(!getLocalTime(&ti)&&r++<10) delay(200); 
+            fetch_glucose(); 
+        } else {
+            update_display();
+        }
+        
+        display.display();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        
+        esp_sleep_enable_timer_wakeup(cfg_fetch_min * 60ULL * 1000000ULL);
+        esp_light_sleep_start();
+        ESP.restart();
+    }
+}
+
+void loop() {
+    if (ap_mode_active) {
+        dnsServer.processNextRequest(); server.handleClient();
+        delay(10);
+    }
+}
